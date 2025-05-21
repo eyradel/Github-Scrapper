@@ -3,13 +3,14 @@ import requests
 import json
 import time
 import base64
+import re
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-def get_all_org_repos():
-    """Get all repositories for the organization with improved pagination handling"""
+def get_all_org_repos(limit=None):
+    """Get repositories for the organization with optional limit"""
     github_token = os.environ.get('GITHUB_TOKEN')
     org_name = os.environ.get('ORG_NAME')
     
@@ -19,7 +20,7 @@ def get_all_org_repos():
         print(f"ORG_NAME: {'Found' if org_name else 'Missing'}")
         return None
     
-    print(f"Fetching repositories for organization: {org_name}")
+    print(f"Fetching repositories for organization: {org_name}" + (f" (limited to {limit})" if limit else ""))
     
     # First verify token permissions
     headers = {
@@ -46,7 +47,7 @@ def get_all_org_repos():
             if 'read:org' not in scopes and 'admin:org' not in scopes:
                 print("WARNING: Your token may not have organization reading permissions.")
         
-        # Fetch all repositories with effective pagination
+        # Fetch repositories with effective pagination
         all_repos = []
         page = 1
         per_page = 100  # Maximum allowed by GitHub API
@@ -60,6 +61,12 @@ def get_all_org_repos():
         for endpoint_base in endpoints:
             print(f"\nUsing endpoint: {endpoint_base}")
             page = 1
+            
+            # Check if we've reached the limit
+            if limit and len(all_repos) >= limit:
+                print(f"Reached specified limit of {limit} repositories. Stopping search.")
+                break
+                
             while True:
                 # Carefully construct parameters to get ALL repos
                 params = {
@@ -109,6 +116,11 @@ def get_all_org_repos():
                 all_repos.extend(new_repos)
                 print(f"Added {len(new_repos)} new repositories. Total unique repos so far: {len(all_repos)}")
                 
+                # Check if we've reached the limit after adding new repos
+                if limit and len(all_repos) >= limit:
+                    print(f"Reached specified limit of {limit} repositories. Stopping search.")
+                    break
+                
                 # Check for more pages
                 if 'Link' in response.headers:
                     links = response.headers['Link']
@@ -122,10 +134,15 @@ def get_all_org_repos():
                 page += 1
                 time.sleep(0.5)  # Be nice to the API
         
+        # Apply limit if specified
+        if limit and len(all_repos) > limit:
+            all_repos = all_repos[:limit]
+            print(f"Trimmed to first {limit} repositories as requested.")
+        
         print(f"\nFound {len(all_repos)} total unique repositories for organization '{org_name}'")
         
         # Double check against expected number
-        if len(all_repos) < 183:
+        if limit is None and len(all_repos) < 183:
             print(f"WARNING: Found {len(all_repos)} repositories, but expected 183 based on the GitHub UI.")
             print("This might be due to permission issues or API limitations.")
         
@@ -218,8 +235,277 @@ def find_file_in_branch(repo_full_name, branch_name, file_path):
         
     return None
 
+def get_branch_tree(repo_full_name, branch_name):
+    """Get the tree of files in a branch with robust error handling"""
+    github_token = os.environ.get('GITHUB_TOKEN')
+    
+    headers = {
+        'Authorization': f'token {github_token}',
+        'Accept': 'application/vnd.github.v3+json'
+    }
+    
+    # First, get the branch reference to get the SHA
+    ref_endpoint = f'https://api.github.com/repos/{repo_full_name}/branches/{branch_name}'
+    
+    # Add retry logic for API requests
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            ref_response = requests.get(ref_endpoint, headers=headers, timeout=30)
+            
+            if handle_rate_limiting(ref_response):
+                continue
+                
+            if ref_response.status_code != 200:
+                print(f"  Warning: Could not get branch reference for {repo_full_name}:{branch_name}")
+                return []
+            
+            branch_data = ref_response.json()
+            commit_sha = branch_data.get('commit', {}).get('sha')
+            
+            if not commit_sha:
+                print(f"  Warning: Could not get commit SHA for {repo_full_name}:{branch_name}")
+                return []
+            
+            # Now get the tree recursively
+            tree_endpoint = f'https://api.github.com/repos/{repo_full_name}/git/trees/{commit_sha}?recursive=1'
+            
+            try:
+                tree_response = requests.get(tree_endpoint, headers=headers, timeout=60)  # Longer timeout
+                
+                if handle_rate_limiting(tree_response):
+                    continue
+                
+                if tree_response.status_code != 200:
+                    print(f"  Warning: Could not get tree for {repo_full_name}:{branch_name}")
+                    return get_python_files_alternative(repo_full_name, branch_name, headers)
+                
+                tree_data = tree_response.json()
+                
+                # Check if tree is truncated
+                if tree_data.get('truncated', False):
+                    print(f"  Tree is truncated for {repo_full_name}:{branch_name}. Using alternative approach...")
+                    return get_python_files_alternative(repo_full_name, branch_name, headers)
+                
+                tree_items = tree_data.get('tree', [])
+                
+                # Filter for Python files
+                python_files = [item for item in tree_items if item.get('type') == 'blob' and item.get('path', '').endswith('.py')]
+                
+                return python_files
+                
+            except (requests.exceptions.RequestException, requests.exceptions.ChunkedEncodingError) as e:
+                # If we fail to get the tree, try alternative approach
+                print(f"  Error fetching tree: {e}. Trying alternative approach...")
+                return get_python_files_alternative(repo_full_name, branch_name, headers)
+                
+        except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+            wait_time = 2 ** attempt
+            print(f"  Attempt {attempt+1}/{max_retries} failed: {e}. Retrying in {wait_time} seconds...")
+            time.sleep(wait_time)
+    
+    # If all retries fail, try alternative approach
+    print(f"  All attempts failed for {repo_full_name}:{branch_name}. Using alternative approach...")
+    return get_python_files_alternative(repo_full_name, branch_name, headers)
+
+def get_python_files_alternative(repo_full_name, branch_name, headers):
+    """Alternative approach to find Python files when the tree API fails"""
+    print(f"  Using alternative approach to find Python files in {repo_full_name}:{branch_name}")
+    
+    # Get the root directory contents
+    root_endpoint = f'https://api.github.com/repos/{repo_full_name}/contents?ref={branch_name}'
+    
+    try:
+        root_response = requests.get(root_endpoint, headers=headers, timeout=30)
+        
+        if handle_rate_limiting(root_response):
+            return []
+            
+        if root_response.status_code != 200:
+            print(f"  Could not get root directory for {repo_full_name}:{branch_name}")
+            return []
+        
+        python_files = []
+        root_contents = root_response.json()
+        
+        # Process root contents
+        for item in root_contents:
+            if item.get('type') == 'file' and item.get('name', '').endswith('.py'):
+                # Add Python files from root
+                python_files.append({
+                    'path': item.get('path'),
+                    'type': 'blob',
+                    'url': item.get('url')
+                })
+            elif item.get('type') == 'dir':
+                # Add files from important directories
+                important_dirs = ['src', 'app', 'lib', 'core', 'models', 'utils']
+                if item.get('name') in important_dirs:
+                    dir_files = get_directory_python_files(repo_full_name, branch_name, item.get('path'), headers)
+                    python_files.extend(dir_files)
+        
+        # If we found too few Python files, try checking some standard directories
+        if len(python_files) < 5:
+            for dir_name in ['src', 'app', 'lib']:
+                dir_files = get_directory_python_files(repo_full_name, branch_name, dir_name, headers)
+                python_files.extend(dir_files)
+        
+        return python_files
+        
+    except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+        print(f"  Error in alternative approach: {e}")
+        return []
+
+def get_directory_python_files(repo_full_name, branch_name, dir_path, headers):
+    """Get Python files from a specific directory"""
+    dir_endpoint = f'https://api.github.com/repos/{repo_full_name}/contents/{dir_path}?ref={branch_name}'
+    
+    try:
+        dir_response = requests.get(dir_endpoint, headers=headers, timeout=30)
+        
+        if dir_response.status_code != 200:
+            return []
+        
+        python_files = []
+        dir_contents = dir_response.json()
+        
+        # Process directory contents
+        for item in dir_contents:
+            if item.get('type') == 'file' and item.get('name', '').endswith('.py'):
+                python_files.append({
+                    'path': item.get('path'),
+                    'type': 'blob',
+                    'url': item.get('url')
+                })
+        
+        return python_files
+        
+    except (requests.exceptions.RequestException, json.JSONDecodeError):
+        # Silently fail for subdirectories
+        return []
+
+def extract_imports_from_python_content(content):
+    """Extract import statements from Python file content"""
+    imports = set()
+    
+    # Regular expressions for different types of imports
+    import_patterns = [
+        r'^\s*import\s+(\w+(?:\s*,\s*\w+)*)',                    # import module, module2
+        r'^\s*from\s+(\w+(?:\.\w+)*)\s+import\s+',               # from module import
+        r'^\s*from\s+(\w+(?:\.\w+)*)\s+import\s+\(',             # from module import (
+        r'^\s*import\s+(\w+(?:\.\w+)*)\s+as\s+\w+',              # import module as alias
+        r'^\s*from\s+(\w+(?:\.\w+)*)\s+import\s+\w+\s+as\s+\w+'  # from module import name as alias
+    ]
+    
+    lines = content.split('\n')
+    for line in lines:
+        # Skip comments
+        if line.strip().startswith('#'):
+            continue
+        
+        for pattern in import_patterns:
+            matches = re.findall(pattern, line, re.MULTILINE)
+            for match in matches:
+                # Handle multiple imports in one line (e.g., import os, sys)
+                for module in match.split(','):
+                    # Get the top-level package name (before any dots)
+                    top_level = module.strip().split('.')[0]
+                    if top_level:
+                        imports.add(top_level)
+    
+    # Filter out standard library modules (this is a simple approach and not comprehensive)
+    std_lib = {
+        'abc', 'argparse', 'asyncio', 'collections', 'concurrent', 'contextlib', 'copy', 
+        'csv', 'datetime', 'decimal', 'email', 'enum', 'functools', 'glob', 'hashlib', 
+        'http', 'importlib', 'inspect', 'io', 'itertools', 'json', 'logging', 'math', 
+        'multiprocessing', 'operator', 'os', 'pathlib', 'pickle', 'random', 're', 
+        'shutil', 'signal', 'socket', 'sqlite3', 'statistics', 'string', 'subprocess', 
+        'sys', 'tempfile', 'threading', 'time', 'traceback', 'typing', 'uuid', 'warnings', 
+        'weakref', 'xml', 'zipfile'
+    }
+    
+    # Return as a set of tuples with a flag indicating if it's a standard library
+    return {(imp, imp in std_lib) for imp in imports}
+
+def get_python_file_content(repo_full_name, branch_name, file_path):
+    """Get the content of a Python file from a branch"""
+    github_token = os.environ.get('GITHUB_TOKEN')
+    
+    headers = {
+        'Authorization': f'token {github_token}',
+        'Accept': 'application/vnd.github.v3+json'
+    }
+    
+    content_endpoint = f'https://api.github.com/repos/{repo_full_name}/contents/{file_path}?ref={branch_name}'
+    content_response = requests.get(content_endpoint, headers=headers)
+    
+    if handle_rate_limiting(content_response):
+        return None
+        
+    if content_response.status_code != 200:
+        return None
+    
+    content_data = content_response.json()
+    if content_data.get('encoding') == 'base64':
+        try:
+            content = base64.b64decode(content_data.get('content')).decode('utf-8', errors='replace')
+            return content
+        except Exception as e:
+            print(f"  Error decoding file {file_path}: {e}")
+    
+    return None
+
+def analyze_python_files_in_branch(repo_full_name, branch_name):
+    """Analyze all Python files in a branch to extract imported libraries"""
+    print(f"  Analyzing Python files in branch: {branch_name}")
+    
+    # Get all Python files in the branch
+    python_files = get_branch_tree(repo_full_name, branch_name)
+    if not python_files:
+        print(f"  No Python files found in branch {branch_name}")
+        return []
+    
+    print(f"  Found {len(python_files)} Python files in branch {branch_name}")
+    
+    # Analyze a subset of files to avoid API rate limits (max 50 files per branch)
+    max_files = 50
+    if len(python_files) > max_files:
+        print(f"  Limiting analysis to {max_files} Python files to avoid API rate limits")
+        python_files = python_files[:max_files]
+    
+    # Process each Python file
+    all_imports = set()
+    processed_files = 0
+    
+    for python_file in python_files:
+        file_path = python_file.get('path')
+        if not file_path:
+            continue
+        
+        print(f"    Analyzing file: {file_path}")
+        
+        # Get file content
+        content = get_python_file_content(repo_full_name, branch_name, file_path)
+        if not content:
+            print(f"    Could not retrieve content for {file_path}")
+            continue
+        
+        # Extract imports
+        file_imports = extract_imports_from_python_content(content)
+        all_imports.update(file_imports)
+        
+        processed_files += 1
+        
+        # Add a delay to avoid hitting API rate limits
+        time.sleep(0.1)
+    
+    print(f"  Processed {processed_files} Python files")
+    print(f"  Found {len(all_imports)} unique imports")
+    
+    return list(all_imports)
+
 def find_python_project_files(repos):
-    """Find repositories with pyproject.toml and requirements.txt files across all branches"""
+    """Find repositories with Python files and analyze their imports"""
     github_token = os.environ.get('GITHUB_TOKEN')
     org_name = os.environ.get('ORG_NAME')
     
@@ -230,8 +516,7 @@ def find_python_project_files(repos):
     
     python_repos = []
     
-    print("\nSearching for Python project files in repositories...")
-    print("Looking for pyproject.toml and requirements.txt files across all branches")
+    print("\nSearching for Python files in repositories...")
     
     for index, repo in enumerate(repos, 1):
         repo_name = repo.get('name')
@@ -270,7 +555,9 @@ def find_python_project_files(repos):
                 'has_setup_py': False,
                 'requirements_content': None,
                 'requirements_packages': [],
-                'pyproject_content': None
+                'pyproject_content': None,
+                'python_imports': [],
+                'python_files_analyzed': 0
             }
             
             # Check for requirements.txt
@@ -304,12 +591,21 @@ def find_python_project_files(repos):
                 branch_data['has_setup_py'] = True
                 print(f"    Found setup.py")
             
-            # Only add branch data if Python files were found
-            if branch_data['has_pyproject'] or branch_data['has_requirements'] or branch_data['has_setup_py']:
-                repo_data['branches'].append(branch_data)
-                repo_data['has_python_files'] = True
+            # Analyze Python files for imports
+            if repo.get('language') == 'Python' or branch_data['has_pyproject'] or branch_data['has_requirements'] or branch_data['has_setup_py']:
+                python_imports = analyze_python_files_in_branch(repo_full_name, branch_name)
+                branch_data['python_imports'] = python_imports
+                branch_data['python_files_analyzed'] = True
+                
+                # Add branch data if Python files or project files were found
+                if python_imports or branch_data['has_pyproject'] or branch_data['has_requirements'] or branch_data['has_setup_py']:
+                    repo_data['branches'].append(branch_data)
+                    repo_data['has_python_files'] = True
+            else:
+                # Skip analyzing Python files if the repository doesn't look like a Python project
+                print(f"    Skipping Python file analysis for branch {branch_name} (not a Python project)")
         
-        # Only include repositories that have Python project files in at least one branch
+        # Only include repositories that have Python files in at least one branch
         if repo_data['has_python_files']:
             python_repos.append(repo_data)
             print(f"  Found Python files in {len(repo_data['branches'])} branches")
@@ -375,7 +671,7 @@ def create_excel_report(python_repos):
     # Add repository overview data
     for row_num, repo in enumerate(python_repos, 2):
         total_branches = len(repo.get('branches', []))
-        branches_with_python = len([b for b in repo.get('branches', []) if b.get('has_pyproject') or b.get('has_requirements') or b.get('has_setup_py')])
+        branches_with_python = len([b for b in repo.get('branches', []) if b.get('has_pyproject') or b.get('has_requirements') or b.get('has_setup_py') or b.get('python_imports')])
         
         ws.cell(row=row_num, column=1).value = repo['name']
         ws.cell(row=row_num, column=2).value = repo.get('description') or "No description"
@@ -420,6 +716,9 @@ def create_excel_report(python_repos):
     # Create a packages matrix sheet
     create_packages_matrix(wb, python_repos)
     
+    # Create an imports sheet
+    create_imports_sheet(wb, python_repos)
+    
     # Create a summary sheet
     create_summary_sheet(wb, python_repos)
     
@@ -427,7 +726,7 @@ def create_excel_report(python_repos):
     ws.freeze_panes = "A2"
     
     # Save the workbook
-    excel_filename = "python_repositories_branch_analysis.xlsx"
+    excel_filename = "python_repositories_analysis.xlsx"
     wb.save(excel_filename)
     print(f"Excel report saved as {excel_filename}")
 
@@ -438,8 +737,8 @@ def create_branches_sheet(workbook, python_repos):
     # Set column headers
     headers = [
         "Repository", "Branch", "Is Default", "Has pyproject.toml", 
-        "Has requirements.txt", "Has setup.py", "Package Count",
-        "Packages List"
+        "Has requirements.txt", "Has setup.py", "Requirements Packages Count",
+        "Python Imports Count", "Package List", "Imports List"
     ]
     
     for col_num, header in enumerate(headers, 1):
@@ -468,6 +767,12 @@ def create_branches_sheet(workbook, python_repos):
             packages = branch.get('requirements_packages', [])
             package_list = ", ".join([f"{p['name']}{p['version'] if p['version'] != 'latest' else ''}" for p in packages])
             
+            # Extract imports from Python files
+            imports = branch.get('python_imports', [])
+            # Filter out standard library modules for the display
+            non_std_imports = [imp for imp, is_std in imports if not is_std]
+            imports_list = ", ".join(sorted(non_std_imports))
+            
             # Color coding
             if branch.get('is_default'):
                 # Use light yellow for default branch
@@ -484,11 +789,13 @@ def create_branches_sheet(workbook, python_repos):
             ws.cell(row=row_num, column=5).value = "Yes" if branch.get('has_requirements') else "No"
             ws.cell(row=row_num, column=6).value = "Yes" if branch.get('has_setup_py') else "No"
             ws.cell(row=row_num, column=7).value = len(packages)
-            ws.cell(row=row_num, column=8).value = package_list
+            ws.cell(row=row_num, column=8).value = len(non_std_imports)
+            ws.cell(row=row_num, column=9).value = package_list
+            ws.cell(row=row_num, column=10).value = imports_list
             
             # Add coloring for default branch
             if branch.get('is_default'):
-                for col_num in range(1, 9):
+                for col_num in range(1, 11):
                     ws.cell(row=row_num, column=col_num).fill = fill
             
             row_num += 1
@@ -501,8 +808,10 @@ def create_branches_sheet(workbook, python_repos):
         4: 15,  # Has pyproject.toml
         5: 15,  # Has requirements.txt
         6: 15,  # Has setup.py
-        7: 12,  # Package Count
-        8: 60,  # Packages List
+        7: 20,  # Requirements Packages Count
+        8: 20,  # Python Imports Count
+        9: 60,  # Package List
+        10: 60,  # Imports List
     }
     
     for col_num, width in column_widths.items():
@@ -588,6 +897,76 @@ def create_packages_matrix(workbook, python_repos):
     # Freeze first two columns and header row
     ws.freeze_panes = "C2"
 
+def create_imports_sheet(workbook, python_repos):
+    """Create a sheet showing imports from Python files"""
+    ws = workbook.create_sheet(title="Python Imports")
+    
+    # Get a list of all unique non-standard library imports across all repos and branches
+    all_imports = set()
+    for repo in python_repos:
+        for branch in repo.get('branches', []):
+            # Filter out standard library imports
+            non_std_imports = [imp for imp, is_std in branch.get('python_imports', []) if not is_std]
+            all_imports.update(non_std_imports)
+    
+    # Sort imports alphabetically
+    all_imports = sorted(list(all_imports))
+    
+    # Add header row with import names
+    ws.cell(row=1, column=1).value = "Repository"
+    ws.cell(row=1, column=2).value = "Branch"
+    
+    for col_num, imp in enumerate(all_imports, 3):
+        ws.cell(row=1, column=col_num).value = imp
+        ws.cell(row=1, column=col_num).font = Font(bold=True)
+        ws.cell(row=1, column=col_num).alignment = Alignment(textRotation=90, horizontal='center')
+    
+    # Add repository and branch rows
+    row_num = 2
+    for repo in python_repos:
+        repo_name = repo['name']
+        
+        # Sort branches to put default branch first
+        branches = sorted(repo.get('branches', []), key=lambda b: (0 if b.get('is_default') else 1, b.get('name')))
+        
+        for branch in branches:
+            branch_name = branch.get('name')
+            
+            # First two columns: repository and branch names
+            ws.cell(row=row_num, column=1).value = repo_name
+            ws.cell(row=row_num, column=2).value = branch_name
+            
+            # Set styling for default branch
+            if branch.get('is_default'):
+                ws.cell(row=row_num, column=1).font = Font(bold=True)
+                ws.cell(row=row_num, column=2).font = Font(bold=True)
+                for col in range(1, 3):
+                    ws.cell(row=row_num, column=col).fill = PatternFill(start_color="FFFFE0", end_color="FFFFE0", fill_type="solid")
+            
+            # Get imports in this branch
+            branch_imports = {imp for imp, is_std in branch.get('python_imports', []) if not is_std}
+            
+            # Fill in the matrix
+            for col_num, imp in enumerate(all_imports, 3):
+                if imp in branch_imports:
+                    cell = ws.cell(row=row_num, column=col_num)
+                    cell.value = "✓"
+                    cell.fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+                    cell.alignment = Alignment(horizontal='center')
+            
+            row_num += 1
+    
+    # Set column widths
+    ws.column_dimensions['A'].width = 25  # Repository name
+    ws.column_dimensions['B'].width = 20  # Branch name
+    
+    # Set width for import columns
+    for col_num in range(3, len(all_imports) + 3):
+        ws.column_dimensions[get_column_letter(col_num)].width = 10
+    
+    # Freeze first two columns and header row
+    ws.freeze_panes = "C2"
+
 def create_summary_sheet(workbook, python_repos):
     """Create a summary sheet with key statistics"""
     ws = workbook.create_sheet(title="Summary")
@@ -601,19 +980,30 @@ def create_summary_sheet(workbook, python_repos):
                                       for branch in repo.get('branches', []) 
                                       if branch.get('is_default'))
     
-    # Count package usage across all branches
+    # Count packages from requirements files
     package_counts = {}
     for repo in python_repos:
         for branch in repo.get('branches', []):
             for pkg in branch.get('requirements_packages', []):
                 package_counts[pkg['name']] = package_counts.get(pkg['name'], 0) + 1
     
-    # Get most common packages
+    # Count non-standard library imports from Python files
+    import_counts = {}
+    for repo in python_repos:
+        for branch in repo.get('branches', []):
+            for imp, is_std in branch.get('python_imports', []):
+                if not is_std:  # Skip standard library imports
+                    import_counts[imp] = import_counts.get(imp, 0) + 1
+    
+    # Get most common packages from requirements
     top_packages = sorted(package_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+    
+    # Get most common imports from Python files
+    top_imports = sorted(import_counts.items(), key=lambda x: x[1], reverse=True)[:20]
     
     # Add summary data
     row = 1
-    ws.cell(row=row, column=1).value = "Python Repositories Branch Analysis"
+    ws.cell(row=row, column=1).value = "Python Repositories Analysis"
     ws.cell(row=row, column=1).font = Font(bold=True, size=14)
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=3)
     
@@ -631,12 +1021,16 @@ def create_summary_sheet(workbook, python_repos):
     ws.cell(row=row, column=3).value = f"{default_branches_with_python/total_repos*100:.1f}%" if total_repos > 0 else "0%"
     
     row += 1
-    ws.cell(row=row, column=1).value = "Total Unique Packages:"
+    ws.cell(row=row, column=1).value = "Total Unique Packages (from requirements):"
     ws.cell(row=row, column=2).value = len(package_counts)
+    
+    row += 1
+    ws.cell(row=row, column=1).value = "Total Unique Imports (from Python files):"
+    ws.cell(row=row, column=2).value = len(import_counts)
     
     # Add top packages section
     row += 2
-    ws.cell(row=row, column=1).value = "Top 20 Most Common Packages Across All Branches"
+    ws.cell(row=row, column=1).value = "Top 20 Most Common Packages (from requirements.txt)"
     ws.cell(row=row, column=1).font = Font(bold=True)
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=3)
     
@@ -654,6 +1048,26 @@ def create_summary_sheet(workbook, python_repos):
         ws.cell(row=row, column=2).value = count
         ws.cell(row=row, column=3).value = f"{count/all_branches*100:.1f}%" if all_branches > 0 else "0%"
     
+    # Add top imports section
+    row += 3  # Add some space
+    ws.cell(row=row, column=1).value = "Top 20 Most Common Imports (from Python files)"
+    ws.cell(row=row, column=1).font = Font(bold=True)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=3)
+    
+    row += 1
+    ws.cell(row=row, column=1).value = "Import"
+    ws.cell(row=row, column=2).value = "Count"
+    ws.cell(row=row, column=3).value = "Percentage of Branches"
+    ws.cell(row=row, column=1).font = Font(bold=True)
+    ws.cell(row=row, column=2).font = Font(bold=True)
+    ws.cell(row=row, column=3).font = Font(bold=True)
+    
+    for imp, count in top_imports:
+        row += 1
+        ws.cell(row=row, column=1).value = imp
+        ws.cell(row=row, column=2).value = count
+        ws.cell(row=row, column=3).value = f"{count/all_branches*100:.1f}%" if all_branches > 0 else "0%"
+    
     # Set column widths
     ws.column_dimensions['A'].width = 35
     ws.column_dimensions['B'].width = 15
@@ -661,7 +1075,7 @@ def create_summary_sheet(workbook, python_repos):
 
 def main():
     """Main function to execute the script"""
-    print("Starting GitHub repository branch scanner...")
+    print("Starting GitHub repository and Python file analyzer...")
     
     # Check if the token has the necessary permissions
     token = os.environ.get('GITHUB_TOKEN')
@@ -695,29 +1109,30 @@ def main():
         except Exception as e:
             print(f"Error checking token permissions: {e}")
     
-    # Get all repositories in the organization
-    repos = get_all_org_repos()
+    # Get limited repositories in the organization (just 10 for testing)
+    repos_limit = 183  # Limit to first 10 repositories
+    print(f"Running with a limit of {repos_limit} repositories for testing purposes")
+    repos = get_all_org_repos(limit=repos_limit)
+    
     if not repos:
         print("No repositories found or an error occurred.")
         return
     
-    # Find repositories with Python project files across branches
+    # Find repositories with Python project files and analyze Python imports
     python_repos = find_python_project_files(repos)
     
     if not python_repos:
         print("No Python projects found in the organization repositories.")
         return
     
-    print(f"\nFound {len(python_repos)} repositories with Python project files.")
+    print(f"\nFound {len(python_repos)} repositories with Python files.")
     
-    # Count total branches with Python files
-    total_branches_with_python = sum(len(repo.get('branches', [])) for repo in python_repos)
-    print(f"These repositories have {total_branches_with_python} branches with Python project files.")
-    
-    # Create Excel report with branch information
+    # Create Excel report with all the collected information
     create_excel_report(python_repos)
     
     print("\nScript completed successfully.")
+    print(f"Note: This run was limited to analyzing {repos_limit} repositories for testing.")
+    print("To scan all repositories, update the limit in the main() function.")
 
 if __name__ == "__main__":
     main()
